@@ -1,153 +1,127 @@
-using JuMP, Ipopt, PowerModels
-using Random, Distributions
-using JSON
-using ProgressMeter
-using ArgParse
-PowerModels.silence() # suppress warning and info messages
-Random.seed!(123)
+import pandapower as pp
+import pandapower.networks as nw
+import pandapower.optimal_powerflow as opf
 
-""" Parse Arguments """
-function parse_commandline()
-    s = ArgParseSettings()
-
-    @add_arg_table s begin
-        "--netname", "-n"
-            help = "The input network name"
-            arg_type = String
-            default = "nesta_case14_ieee"
-        "--output", "-o"
-            help = "the output name"
-            arg_type = String
-            default = "traindata_ext"
-        "--lb"
-            help = "The lb (in %) of the load interval"
-            arg_type = Float64
-            default = 0.8
-        "--ub"
-            help = "The ub (in %) of the load interval"
-            arg_type = Float64
-            default = 1.2
-        "--step"
-            help = "The step size resulting in a new load x + step"
-            arg_type = Float64
-            default = 0.1
-        "--nperm"
-            help = "The number of load permutations for each laod scale"
-            arg_type = Int
-            default = 10
-    end
-    return parse_args(s)
-end
-
-function scale_load(data, scale_coef)
-   newdata = deepcopy(data)
-   for (i, (k, ld)) in enumerate(newdata["load"])
-        if (ld["pd"] > 0)
-            ld["pd"] = ld["pd"] * scale_coef[i]
-            ld["qd"] = ld["qd"] * scale_coef[i]
-        end
-   end
-   return newdata
-end
-
-function get_load_coefficients(µ, ∑, n)
-    x = rand(TruncatedNormal(µ, ∑, µ-0.1, µ+0.1), n)
-    model = Model(with_optimizer(Ipopt.Optimizer, print_level=0))
-    @variable(model, 0 <= _x[1:n] <= µ)
-    @objective(model, Min, sum((_x[i] - x[i])^2 for i in 1:n))
-    @constraint(model, mean(_x) == µ)
-    JuMP.optimize!(model)
-    return [JuMP.value(_x[i]) for i in 1:n]
-end
+import numpy as np
+from scipy.stats import truncnorm
+import os
+import json
+import argparse
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 
-args = parse_commandline()
-
-data_path = "data/"
-outdir = data_path * "traindata/" * args["netname"]
-fileout = outdir * "/" * args["output"]  * ".json"
-mkpath(outdir)
-filein = data_path * "inputs/" * args["netname"] * ".m"
-data = PowerModels.parse_file(filein)
-Load_range = collect(args["lb"]:args["step"]:(args["ub"]))
-solver = JuMP.with_optimizer(Ipopt.Optimizer, print_level=0)
-nloads = length(data["load"])
-res_stack = []
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--netname", "-n", type=str, default="case14")
+    parser.add_argument("--output", "-o", type=str, default="traindata_ext")
+    parser.add_argument("--lb", type=float, default=0.8)
+    parser.add_argument("--ub", type=float, default=1.2)
+    parser.add_argument("--step", type=float, default=0.1)
+    parser.add_argument("--nperm", type=int, default=10)
+    return parser.parse_args()
 
 
-################
-# Run tests
-n = length(Load_range * args["nperm"])
-p = Progress(n, 0.1)   # minimum update interval: 1 second
-for µ in Load_range
-    ∑ = 0.01
+def get_network(netname):
+    if netname == "case14":
+        return nw.case14()
+    else:
+        raise NotImplementedError(f"Network '{netname}' not supported yet.")
 
-    for rep in 1:args["nperm"]
-        load_scale = get_load_coefficients(µ, ∑, nloads)
-        newdata = scale_load(data, load_scale)
-        opf_sol = PowerModels.run_ac_opf(newdata, solver, setting = Dict("output" => Dict("branch_flows" => true)))
 
-        if opf_sol["termination_status"] == LOCALLY_SOLVED
-            # Retrieve: (p^d, q^d) and (p^g, v)
-            res  = Dict{String, Any}()
-            res["scale"] = mean(load_scale)
-            res["pd"] = Dict(name => load["pd"] for (name, load) in newdata["load"])
-            res["qd"] = Dict(name => load["qd"] for (name, load) in newdata["load"])
-            res["vg"] = Dict(name => opf_sol["solution"]["bus"][string(gen["gen_bus"])]["vm"]
-                                        for (name, gen) in newdata["gen"]
-                                            if data["gen"][name]["pmax"] > 0)
-            res["pg"] = Dict(name => gen["pg"] for (name, gen) in opf_sol["solution"]["gen"]
-                                            if data["gen"][name]["pmax"] > 0)
-            res["qg"] = Dict(name => gen["qg"] for (name, gen) in opf_sol["solution"]["gen"]
-                                            if data["gen"][name]["pmax"] > 0)
+def get_load_coefficients_fast(mu, sigma, n):
+    lower, upper = mu - 0.1, mu + 0.1
+    a, b = (lower - mu) / sigma, (upper - mu) / sigma
+    x = truncnorm.rvs(a, b, loc=mu, scale=sigma, size=n)
+    factor = mu * n / sum(x)
+    return np.clip(x * factor, 0.0, mu)
 
-            # Lines
-            res["pt"] = Dict(name => data["pt"] for (name, data) in opf_sol["solution"]["branch"])
-            res["pf"] = Dict(name => data["pf"] for (name, data) in opf_sol["solution"]["branch"])
-            res["qt"] = Dict(name => data["qt"] for (name, data) in opf_sol["solution"]["branch"])
-            res["qf"] = Dict(name => data["qf"] for (name, data) in opf_sol["solution"]["branch"])
 
-            # Buses
-            res["va"] = Dict(name => data["va"] for (name, data) in opf_sol["solution"]["bus"])
-            res["vm"] = Dict(name => data["vm"] for (name, data) in opf_sol["solution"]["bus"])
-            res["objective"] = opf_sol["objective"]
-            res["solve_time"] = opf_sol["solve_time"]
-            push!(res_stack, res)
-        end
-        next!(p)
-    end
-end
+def scale_load(net, scale_factors):
+    for i, load in enumerate(net.load.itertuples()):
+        net.load.at[load.Index, 'p_mw'] *= scale_factors[i]
+        net.load.at[load.Index, 'q_mvar'] *= scale_factors[i]
+    return net
 
-#########################
-# Problem Constraints
-pglim = Dict{}(name => (gen["pmin"], gen["pmax"]) for (name, gen) in data["gen"]
-                                                    if data["gen"][name]["pmax"] > 0)
-qglim = Dict{}(name => (gen["qmin"], gen["qmax"]) for (name, gen) in data["gen"]
-                                                    if data["gen"][name]["pmax"] > 0)
-vglim = Dict{}(name => (data["bus"][string(gen["gen_bus"])]["vmin"],
-                       data["bus"][string(gen["gen_bus"])]["vmax"])
-                          for (name, gen) in data["gen"]
-                              if data["gen"][name]["pmax"] > 0)
 
-vm_lim = Dict{}(name => (bus["vmin"], bus["vmax"]) for (name, bus) in data["bus"])
-rate_a = Dict{}(name => (branch["rate_a"]) for (name, branch) in data["branch"])
-                                                    # !gen["transformer"]
-line_br_rx = Dict{}(name =>
-        (branch["br_r"], branch["br_x"]) for (name, branch) in data["branch"])
-line_bg = Dict{}(name =>
-        (branch["g_to"] + branch["g_fr"],
-         branch["b_to"] + branch["b_fr"]) for (name, branch) in data["branch"])
+def run_single_opf(idx, load_range, base_net, nperm, nloads):
+    mu_idx = idx // nperm
+    mu = load_range[mu_idx]
+    sigma = 0.01
 
-out_res = Dict{String, Any}()
-out_res["experiments"] = res_stack
-out_res["constraints"] = Dict("vg_lim" => vglim, "pg_lim" => pglim, "qg_lim" => qglim,
-                              "vm_lim" => vm_lim,
-                              "rate_a" => rate_a, "line_rx" => line_br_rx,
-                              "line_bg" => line_bg)
+    scale_factors = get_load_coefficients_fast(mu, sigma, nloads)
 
-##########################
-# Write file out
-open(fileout, "w") do f
-    write(f, "$(JSON.json(out_res, 4))")
-    println("Writing:  ", fileout)
-end
+    net_copy = pp.copy.deepcopy(base_net)
+    net_copy = scale_load(net_copy, scale_factors)
+
+    try:
+        opf.runopp(net_copy)
+        if not net_copy.OPF_converged:
+            return None
+    except:
+        return None
+
+    res = {
+        "scale": float(np.mean(scale_factors)),
+        "pd": {str(i): float(p) for i, p in enumerate(net_copy.load["p_mw"].values)},
+        "qd": {str(i): float(q) for i, q in enumerate(net_copy.load["q_mvar"].values)},
+        "vg": {str(i): float(vm) for i, vm in zip(net_copy.gen.index, net_copy.res_bus.loc[net_copy.gen["bus"], "vm_pu"])},
+        "pg": {str(i): float(p) for i, p in zip(net_copy.gen.index, net_copy.res_gen["p_mw"].values)},
+        "qg": {str(i): float(q) for i, q in zip(net_copy.gen.index, net_copy.res_gen["q_mvar"].values)},
+        "vm": {str(i): float(vm) for i, vm in enumerate(net_copy.res_bus["vm_pu"].values)},
+        "va": {str(i): float(va) for i, va in enumerate(net_copy.res_bus["va_degree"].values)},
+        "objective": float(net_copy.res_cost)
+    }
+    return res
+
+
+def main():
+    args = parse_args()
+    base_net = get_network(args.netname)
+
+    # Output paths
+    outdir = os.path.join("C:/dnn-opf/src/data/traindata", args.netname)
+    os.makedirs(outdir, exist_ok=True)
+    fileout = os.path.join(outdir, args.output + ".json")
+
+    load_range = np.arange(args.lb, args.ub + 1e-8, args.step)
+    nloads = len(base_net.load)
+    total_runs = len(load_range) * args.nperm
+
+    # Run all OPF scenarios in parallel
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(run_single_opf, i, load_range, base_net, args.nperm, nloads)
+                   for i in range(total_runs)]
+        results = [f.result() for f in tqdm(futures)]
+
+    experiments = list(filter(None, results))
+
+    # Gather constraint data
+    constraints = {
+        "vg_lim": {str(i): (float(row["min_vm_pu"]), float(row["max_vm_pu"]))
+                   for i, row in base_net.gen.iterrows()},
+        "pg_lim": {str(i): (float(row["min_p_mw"]), float(row["max_p_mw"]))
+                   for i, row in base_net.gen.iterrows()},
+        "qg_lim": {str(i): (float(row["min_q_mvar"]), float(row["max_q_mvar"]))
+                   for i, row in base_net.gen.iterrows()},
+        "vm_lim": {str(i): (float(row["min_vm_pu"]), float(row["max_vm_pu"]))
+                   for i, row in base_net.bus.iterrows()},
+        "rate_a": {str(i): float(row["max_loading_percent"])
+                   for i, row in base_net.line.iterrows()},
+        "line_rx": {str(i): (float(row["r_ohm_per_km"]), float(row["x_ohm_per_km"]))
+                    for i, row in base_net.line.iterrows()}
+    }
+
+    out_data = {
+        "experiments": experiments,
+        "constraints": constraints
+    }
+
+    with open(fileout, "w") as f:
+        json.dump(out_data, f, indent=4)
+
+    print("Saved output to:", fileout)
+
+
+if __name__ == "__main__":
+    main()
